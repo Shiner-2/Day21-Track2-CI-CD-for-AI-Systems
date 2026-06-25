@@ -11,7 +11,7 @@ on:
 
 jobs:
 
-  # JOB 1: Chay unit tests tren du lieu ao (khong can GCS)
+  # JOB 1: Chay unit tests tren du lieu ao (khong can cloud)
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -60,24 +60,27 @@ jobs:
           with open("outputs/metrics.json") as f:
               metrics = json.load(f)
           acc = metrics["accuracy"]
-          print(f"Accuracy: {acc:.4f}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"accuracy={acc}\n")
+          f1  = metrics["f1_score"]
+          print(f"Accuracy: {acc:.4f} | F1: {f1:.4f}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fout:
+              fout.write(f"accuracy={acc}\n")
           EOF
 
-      - name: Upload model as artifact
+      - name: Upload model as GitHub artifact
         uses: actions/upload-artifact@v4
         with:
-          name: model
+          name: model-pkl
           path: models/model.pkl
+          retention-days: 30
 
-      - name: Save metrics as artifact
+      - name: Save metrics as GitHub artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
+          name: metrics-json
           path: outputs/metrics.json
+          retention-days: 30
 
-  # JOB 3: Kiem tra chat luong - chi deploy khi accuracy >= 0.70
+  # JOB 3: Eval gate - chi deploy khi accuracy >= 0.70
   eval:
     name: Eval
     needs: train
@@ -89,38 +92,82 @@ jobs:
           import sys
           accuracy = float("${{ needs.train.outputs.accuracy }}")
           threshold = 0.70
-          print(f"Accuracy: {accuracy:.4f} | Threshold: {threshold}")
+          print(f"Accuracy:  {accuracy:.4f}")
+          print(f"Threshold: {threshold:.2f}")
+          print("-" * 30)
           if accuracy < threshold:
-              print(f"FAILED: accuracy {accuracy:.4f} < {threshold} -- deploy bi chan!")
+              print(f"BLOCKED: {accuracy:.4f} < {threshold} -- Deploy bi chan tu dong!")
               sys.exit(1)
           else:
-              print(f"PASSED: accuracy {accuracy:.4f} >= {threshold} -- tien hanh deploy!")
+              print(f"PASSED: {accuracy:.4f} >= {threshold} -- Chuan bi deploy!")
           EOF
 
-  # JOB 4: Deploy qua SSH vao may local (qua ngrok)
+  # JOB 4: Deploy - chay FastAPI server va kiem tra endpoint
   deploy:
     name: Deploy
     needs: eval
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          host: ${{ secrets.VM_HOST }}
-          port: ${{ secrets.VM_PORT }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            cd "${{ secrets.VM_WORKDIR }}"
-            pkill -f "uvicorn" || true
-            sleep 2
-            nohup .venv310/Scripts/python -m uvicorn src.serve:app --host 0.0.0.0 --port 8000 > /tmp/serve.log 2>&1 &
-            sleep 5
-            HEALTH=$(curl -s http://localhost:8000/health || echo "failed")
-            echo "Health check: $HEALTH"
-            if echo "$HEALTH" | grep -q "ok"; then
-              echo "Deploy thanh cong!"
-            else
-              echo "Health check that bai!"
-              exit 1
-            fi
+          python-version: "3.10"
+
+      - name: Install serve dependencies
+        run: pip install fastapi uvicorn joblib scikit-learn
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: model-pkl
+          path: models/
+
+      - name: Start FastAPI server
+        run: |
+          nohup python -m uvicorn src.serve:app --host 0.0.0.0 --port 8000 > /tmp/serve.log 2>&1 &
+          echo "Waiting for server to start..."
+          sleep 8
+          cat /tmp/serve.log || true
+
+      - name: Health check - GET /health
+        run: |
+          HEALTH=$(curl -sf http://localhost:8000/health)
+          echo "Health response: $HEALTH"
+          if echo "$HEALTH" | grep -q "ok"; then
+            echo "Health check PASSED"
+          else
+            echo "Health check FAILED"
+            exit 1
+          fi
+
+      - name: Predict check - POST /predict
+        run: |
+          RESULT=$(curl -sf -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"features": [7.4, 0.7, 0.0, 1.9, 0.076, 11.0, 34.0, 0.9978, 3.51, 0.56, 9.4, 0]}')
+          echo "Predict response: $RESULT"
+          if echo "$RESULT" | grep -q "prediction"; then
+            echo "Predict check PASSED"
+          else
+            echo "Predict check FAILED"
+            exit 1
+          fi
+
+      - name: Download metrics artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics-json
+          path: outputs/
+
+      - name: Print final summary
+        run: |
+          echo "========================================"
+          echo "DEPLOYMENT SUMMARY"
+          echo "========================================"
+          cat outputs/metrics.json
+          echo ""
+          echo "FastAPI server: RUNNING"
+          echo "Health endpoint: OK"
+          echo "Predict endpoint: OK"
+          echo "========================================"
