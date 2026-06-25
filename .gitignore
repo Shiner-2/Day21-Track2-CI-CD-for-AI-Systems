@@ -2,12 +2,13 @@ mlflow.db
 mlartifacts/
 models/
 outputs/
-data/train_phase1.csv
-data/eval.csv
-data/train_phase2.csv
 sa-key.json
 .env
 .venv/
+.venv310/
 __pycache__/
 *.pyc
 .DS_Store
+run_experiments.py
+submission/
+mlruns/

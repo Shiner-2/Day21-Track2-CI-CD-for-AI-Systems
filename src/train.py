@@ -21,64 +21,75 @@ def train(
 
     Tham so:
         params     : dict chua cac sieu tham so cho RandomForestClassifier.
-        data_path  : duong dan den file du lieu huan luyen.
+        data_path  : duong dan den file du lieu huan luyen (co the la nhieu file cach nhau dau phay).
         eval_path  : duong dan den file du lieu danh gia.
 
     Tra ve:
         accuracy (float): do chinh xac tren tap danh gia.
     """
 
-    # TODO 1: Doc du lieu huan luyen va danh gia
-    # df_train = ...
-    # df_eval  = ...
+    # Doc du lieu huan luyen - ho tro nhieu file (noi cach nhau bang dau phay)
+    data_files = [p.strip() for p in data_path.split(",") if os.path.exists(p.strip())]
+    df_train = pd.concat([pd.read_csv(f) for f in data_files], ignore_index=True)
+    df_eval  = pd.read_csv(eval_path)
 
-    # TODO 2: Tach dac trung (X) va nhan (y)
-    # X_train = df_train.drop(columns=["target"])
-    # y_train = ...
-    # X_eval  = ...
-    # y_eval  = ...
+    print(f"Du lieu huan luyen: {len(df_train)} mau tu {data_files}")
+
+    # Tach dac trung (X) va nhan (y)
+    X_train = df_train.drop(columns=["target"])
+    y_train = df_train["target"]
+    X_eval  = df_eval.drop(columns=["target"])
+    y_eval  = df_eval["target"]
+
+    # Cau hinh MLflow tracking URI
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+    mlflow.set_tracking_uri(tracking_uri)
 
     with mlflow.start_run():
 
-        # TODO 3: Ghi nhan cac sieu tham so
-        # mlflow.log_params(...)
+        # Ghi nhan cac sieu tham so
+        mlflow.log_params(params)
+        mlflow.log_param("n_train_samples", len(df_train))
 
-        # TODO 4: Khoi tao va huan luyen RandomForestClassifier
-        # Goi y: su dung random_state=42 de dam bao tinh tai tao
-        # model = RandomForestClassifier(...)
-        # model.fit(...)
+        # Khoi tao va huan luyen RandomForestClassifier
+        model = RandomForestClassifier(
+            n_estimators=params.get("n_estimators", 100),
+            max_depth=params.get("max_depth", None),
+            min_samples_split=params.get("min_samples_split", 2),
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X_train, y_train)
 
-        # TODO 5: Du doan tren tap danh gia va tinh chi so
-        # preds = ...
-        # acc   = accuracy_score(...)
-        # f1    = f1_score(..., average="weighted")
+        # Du doan tren tap danh gia va tinh chi so
+        preds = model.predict(X_eval)
+        acc   = accuracy_score(y_eval, preds)
+        f1    = f1_score(y_eval, preds, average="weighted")
 
-        # TODO 6: Ghi nhan chi so vao MLflow
-        # mlflow.log_metric("accuracy", ...)
-        # mlflow.log_metric("f1_score", ...)
-        # mlflow.sklearn.log_model(model, "model")
+        # Ghi nhan chi so vao MLflow
+        mlflow.log_metric("accuracy", acc)
+        mlflow.log_metric("f1_score", f1)
+        mlflow.sklearn.log_model(model, "model")
 
-        # TODO 7: In ket qua ra man hinh
-        # print(f"Accuracy: {acc:.4f} | F1: {f1:.4f}")
+        # In ket qua ra man hinh
+        print(f"Accuracy: {acc:.4f} | F1: {f1:.4f}")
 
-        # TODO 8: Luu metrics ra file outputs/metrics.json
-        # File nay duoc doc boi GitHub Actions o Buoc 2
-        # os.makedirs("outputs", exist_ok=True)
-        # with open("outputs/metrics.json", "w") as f:
-        #     json.dump({"accuracy": acc, "f1_score": f1}, f)
+        # Luu metrics ra file outputs/metrics.json
+        os.makedirs("outputs", exist_ok=True)
+        with open("outputs/metrics.json", "w") as f:
+            json.dump({"accuracy": acc, "f1_score": f1}, f)
 
-        # TODO 9: Luu mo hinh ra file models/model.pkl
-        # File nay duoc upload len GCS o Buoc 2
-        # os.makedirs("models", exist_ok=True)
-        # joblib.dump(model, "models/model.pkl")
+        # Luu mo hinh ra file models/model.pkl
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(model, "models/model.pkl")
 
-        pass  # xoa dong nay sau khi hoan thanh tat ca TODO ben tren
-
-    # TODO 10: Tra ve acc
-    # return acc
+    return acc
 
 
 if __name__ == "__main__":
     with open("params.yaml") as f:
         params = yaml.safe_load(f)
-    train(params)
+
+    # Dung ca phase1 + phase2 khi co the de dat accuracy cao hon
+    data_path = "data/train_phase1.csv,data/train_phase2.csv"
+    train(params, data_path=data_path)
