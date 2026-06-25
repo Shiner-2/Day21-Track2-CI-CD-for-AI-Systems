@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'data/**.csv'
+      - 'data/**.dvc'
       - 'src/**.py'
       - 'params.yaml'
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
-  # JOB 2: Huan luyen mo hinh tren du lieu thuc
+  # JOB 2: Huan luyen mo hinh tren du lieu thuc, upload model len S3
   train:
     name: Train
     needs: test
@@ -45,6 +45,14 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Pull data with DVC
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          dvc pull
 
       - name: Train model
         env:
@@ -66,21 +74,28 @@ jobs:
               fout.write(f"accuracy={acc}\n")
           EOF
 
-      - name: Upload model as GitHub artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-pkl
-          path: models/model.pkl
-          retention-days: 30
+      - name: Upload model to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          python - <<'EOF'
+          import boto3
+          import os
+          s3 = boto3.client("s3")
+          s3.upload_file("models/model.pkl", os.environ["CLOUD_BUCKET"], "models/latest/model.pkl")
+          print("Model uploaded to S3 successfully!")
+          EOF
 
-      - name: Save metrics as GitHub artifact
+      - name: Save metrics as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metrics-json
+          name: metrics
           path: outputs/metrics.json
-          retention-days: 30
 
-  # JOB 3: Eval gate - chi deploy khi accuracy >= 0.70
+  # JOB 3: Kiem tra chat luong - chi cho phep deploy khi accuracy >= 0.70
   eval:
     name: Eval
     needs: train
@@ -102,7 +117,7 @@ jobs:
               print(f"PASSED: {accuracy:.4f} >= {threshold} -- Chuan bi deploy!")
           EOF
 
-  # JOB 4: Deploy - chay FastAPI server va kiem tra endpoint
+  # JOB 4: Deploy - copy code len EC2 va restart systemd service
   deploy:
     name: Deploy
     needs: eval
@@ -110,29 +125,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Copy serve.py to VM
+        uses: appleboy/scp-action@v0.1.7
         with:
-          python-version: "3.10"
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "src/serve.py"
+          target: "/home/${{ secrets.VM_USER }}/"
 
-      - name: Install serve dependencies
-        run: pip install fastapi uvicorn joblib scikit-learn
-
-      - name: Download model artifact
-        uses: actions/download-artifact@v4
+      - name: Restart FastAPI service on VM
+        uses: appleboy/ssh-action@v1.0.3
         with:
-          name: model-pkl
-          path: models/
-
-      - name: Start FastAPI server
-        run: |
-          nohup python -m uvicorn src.serve:app --host 0.0.0.0 --port 8000 > /tmp/serve.log 2>&1 &
-          echo "Waiting for server to start..."
-          sleep 8
-          cat /tmp/serve.log || true
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            sudo systemctl restart mlops-serve
+            echo "Waiting for server to load model..."
+            sleep 10
+            sudo systemctl status mlops-serve --no-pager
 
       - name: Health check - GET /health
         run: |
-          HEALTH=$(curl -sf http://localhost:8000/health)
+          HEALTH=$(curl -sf http://${{ secrets.VM_HOST }}:8000/health)
           echo "Health response: $HEALTH"
           if echo "$HEALTH" | grep -q "ok"; then
             echo "Health check PASSED"
@@ -143,7 +159,7 @@ jobs:
 
       - name: Predict check - POST /predict
         run: |
-          RESULT=$(curl -sf -X POST http://localhost:8000/predict \
+          RESULT=$(curl -sf -X POST http://${{ secrets.VM_HOST }}:8000/predict \
             -H "Content-Type: application/json" \
             -d '{"features": [7.4, 0.7, 0.0, 1.9, 0.076, 11.0, 34.0, 0.9978, 3.51, 0.56, 9.4, 0]}')
           echo "Predict response: $RESULT"
@@ -153,21 +169,3 @@ jobs:
             echo "Predict check FAILED"
             exit 1
           fi
-
-      - name: Download metrics artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: metrics-json
-          path: outputs/
-
-      - name: Print final summary
-        run: |
-          echo "========================================"
-          echo "DEPLOYMENT SUMMARY"
-          echo "========================================"
-          cat outputs/metrics.json
-          echo ""
-          echo "FastAPI server: RUNNING"
-          echo "Health endpoint: OK"
-          echo "Predict endpoint: OK"
-          echo "========================================"
